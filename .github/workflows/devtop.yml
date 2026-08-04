@@ -117,7 +117,7 @@ jobs:
           # 注意：Tailscale SSH（--ssh）仅支持 Linux/macOS 服务端，
           # Windows 上不生效。参见 https://tailscale.com/kb/1193/tailscale-ssh
           # Windows 上的 SSH 使用传统的 OpenSSH over Tailscale 网络
-          & "$tsPath\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=windows
+          & "$tsPath\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=devtop
           
           # 等待 Tailscale 分配 IP
           $tsIP = $null
@@ -146,19 +146,19 @@ jobs:
               
               if ($deviceId) {
                   try {
-                      # 清理旧 windows 设备
+                      # 清理旧 devtop 设备
                       $allDevices = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" -Method Get -Headers $headers
                       $currentApi = $allDevices.devices | Where-Object { $_.nodeId -eq $deviceId }
                       if ($currentApi) { $deviceId = $currentApi.id }
                       
-                      $allDevices.devices | Where-Object { $_.hostname -eq "windows" -and $_.id -ne $deviceId } | ForEach-Object {
+                      $allDevices.devices | Where-Object { $_.hostname -eq "devtop" -and $_.id -ne $deviceId } | ForEach-Object {
                           Write-Host "  Cleaning old device: $($_.name) (ID: $($_.id))"
                           try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)/authorized" -Method Post -Headers $headers -Body (@{ "authorized" = $false } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop } catch {}
                           try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)" -Method Delete -Headers $headers -ErrorAction Stop } catch {}
                       }
                       # 设置主机名
-                      Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" -Method Post -Headers $headers -Body (@{ "name" = "windows" } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                      Write-Host "  Machine name set to 'windows'."
+                      Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" -Method Post -Headers $headers -Body (@{ "name" = "devtop" } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                      Write-Host "  Machine name set to 'devtop'."
                   } catch { Write-Warning "  API operation failed (non-critical): $_" }
 
                   # MagicDNS
@@ -170,8 +170,8 @@ jobs:
                       }
                       $tailnetDomain = (& "$tsPath\tailscale.exe" status --json 2>$null | ConvertFrom-Json).MagicDNSSuffix
                       if ($tailnetDomain) {
-                          echo "TAILSCALE_DNS=windows.$tailnetDomain" >> $env:GITHUB_ENV
-                          Write-Host "  MagicDNS: windows.$tailnetDomain"
+                          echo "TAILSCALE_DNS=devtop.$tailnetDomain" >> $env:GITHUB_ENV
+                          Write-Host "  MagicDNS: devtop.$tailnetDomain"
                       }
                   } catch { Write-Warning "  MagicDNS check failed (non-critical): $_" }
               }
@@ -208,199 +208,19 @@ jobs:
           Write-Host "Tailscale 配置完成！IP: $tsIP"
 
           Write-Host "=== Tailscale 配置完成 ==="
-      - name: Install and Start llama.cpp
-        run: |
-          # ════════════════════════════════════════════
-          # 1. winget 安装 llama.cpp
-          #    --source winget 跳过 msstore 协议确认
-          # ════════════════════════════════════════════
-          Write-Host "Installing llama.cpp via winget..."
-          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "llama.cpp", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-              Write-Error "winget install llama.cpp failed with exit code $($proc.ExitCode)"
-              exit 1
-          }
-          Write-Host "llama.cpp installed via winget."
-
-          # 刷新 PATH，使 llama.exe 在当前会话中可用
-          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
-
-          # ════════════════════════════════════════════
-          # 2. 查找 llama.exe 并写入系统 PATH（持久化）
-          # ════════════════════════════════════════════
-          $llamaPath = & where.exe llama.exe 2>$null
-          if (-not $llamaPath) {
-              $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source
-          }
-          if (-not $llamaPath -or -not (Test-Path $llamaPath)) {
-              Write-Error "llama.exe not found after winget install"
-              exit 1
-          }
-          Write-Host "llama.cpp installed. Path: $llamaPath"
-
-          $llamaDir = Split-Path $llamaPath -Parent
-          $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-          if ($currentPath -notlike "*$llamaDir*") {
-              [Environment]::SetEnvironmentVariable('Path', "$currentPath;$llamaDir", 'Machine')
-              Write-Host "Added $llamaDir to system PATH."
-          }
-          # 跨步骤持久化 PATH
-          echo "$llamaDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
-
-          # ════════════════════════════════════════════
-          # 3. 使用 llama download 下载 MiniCPM5 模型（带 300s 超时）
-          # ════════════════════════════════════════════
-          Write-Host "Downloading MiniCPM5-1B-F16.gguf via llama download..."
-
-          $modelDir = "C:\ProgramData\llama-models"
-          $null = New-Item -Path $modelDir -ItemType Directory -Force
-          # 赋予 Everyone 读取权限，确保 RDP 用户也可访问
-          icacls $modelDir /grant "Everyone:(OI)(CI)R" /T /Q 2>$null
-          $modelPath = "$modelDir\MiniCPM5-1B-F16.gguf"
-
-          # llama download 带超时包装
-          $dlTimeout = 300
-          $dlJob = Start-Job -Name "ModelDownload" -ScriptBlock {
-              param($lp, $repo, $file)
-              & $lp download --hf-repo $repo --hf-file $file
-          } -ArgumentList $llamaPath, "openbmb/MiniCPM5-1B-GGUF", "MiniCPM5-1B-F16.gguf"
-          $dlJob | Wait-Job -Timeout $dlTimeout | Out-Null
-          if ($dlJob.State -eq 'Running') {
-              $dlJob | Stop-Job | Out-Null
-              Write-Warning "Model download timed out after ${dlTimeout}s, continuing with cache search..."
-          }
-          Receive-Job $dlJob 2>&1 | Out-Null
-
-          # 不依赖 $LASTEXITCODE（新版可能返回非零即使成功），搜索缓存/模型目录
-          if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
-              $cacheRoots = @(
-                  "$modelDir"
-                  "$env:USERPROFILE\.cache\huggingface\hub"
-                  "$env:LOCALAPPDATA\huggingface\hub"
-                  [Environment]::GetFolderPath('CommonApplicationData') + "\huggingface\hub"
-              )
-              $downloaded = $null
-              foreach ($root in $cacheRoots) {
-                  if (Test-Path $root) {
-                      $found = Get-ChildItem -Path $root -Filter "MiniCPM5-1B-F16.gguf" -Recurse -ErrorAction SilentlyContinue |
-                          Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                      if ($found) { $downloaded = $found; break }
-                  }
-              }
-              if ($downloaded) {
-                  Write-Host "  Found in cache: $($downloaded.FullName)"
-                  Copy-Item $downloaded.FullName $modelPath -Force
-              }
-          }
-
-          if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
-              Write-Error "llama download failed — check network or Hugging Face availability"
-              exit 1
-          }
-          $localMB = [math]::Round((Get-Item $modelPath).Length / 1MB, 2)
-          Write-Host "Model ready at: $modelPath ($localMB MB)"
-
-          # ════════════════════════════════════════════
-          # 4. 创建开机启动计划任务
-          #    llama serve 本身在 Maintain Connection 步骤中启动
-          #    （因为 GitHub Actions 会在步骤结束时杀掉子进程）
-          # ════════════════════════════════════════════
-          $null = New-Item -Path "$env:ProgramData\llama-models" -ItemType Directory -Force
-
-          $logFile = "$env:ProgramData\llama-models\llama-server.log"
-          $serveArgs = "serve --port 8080 --host 0.0.0.0 --model `"$modelPath`""
-
-          $taskName = "llama-cpp-serve"
-          schtasks /CREATE /TN $taskName /SC ONSTART /DELAY 0001:00 /RL HIGHEST /RU SYSTEM /TR "`"$llamaPath`" $serveArgs" /F 2>$null
-          if ($LASTEXITCODE -eq 0) {
-              Write-Host "Created scheduled task '$taskName' for auto-start on boot."
-          } else {
-              Write-Warning "Scheduled task creation skipped (exit code: $LASTEXITCODE)."
-          }
-
-          Write-Host "llama.cpp install and model download complete. Server will start in next step."
       - name: Maintain Connection
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Write-Host "`n=== RDP + llama.cpp 服务已就绪 ==="
+          Write-Host "`n=== RDP 服务已就绪 ==="
           Write-Host "RDP Address (Tailscale IP): $env:TAILSCALE_IP"
           if ($env:TAILSCALE_DNS) {
               Write-Host "RDP Address (MagicDNS):    $env:TAILSCALE_DNS"
           }
-          Write-Host "llama.cpp API:              http://$env:TAILSCALE_IP`:8080"
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "===================================`n"
-
-          # 刷新 PATH（$env:GITHUB_PATH 在上一步已写，新进程才生效，此处手动刷新）
-          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
-
-          # 查找 llama.exe
-          $llamaPath = & where.exe llama.exe 2>$null
-          if (-not $llamaPath) { $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source }
-          if (-not $llamaPath) {
-              # 最后兜底：winget 默认安装路径
-              $llamaPath = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama.exe"
-              if (-not (Test-Path $llamaPath)) { $llamaPath = $null }
-          }
-
-          if (-not $llamaPath) {
-              Write-Error "llama.exe not found. Install step may have failed."
-              exit 1
-          }
-
-          $modelPath = "C:\ProgramData\llama-models\MiniCPM5-1B-F16.gguf"
-          $logFile = "$env:ProgramData\llama-models\llama-server.log"
-
-          if (-not (Test-Path $modelPath)) {
-              Write-Error "Model not found at $modelPath. Download step may have failed."
-              exit 1
-          }
-
-          Write-Host "Starting llama.exe serve (PID will stay alive in this step)..."
-          $serveProc = Start-Process -FilePath $llamaPath `
-              -ArgumentList "serve --port 8080 --host 0.0.0.0 --model `"$modelPath`"" `
-              -NoNewWindow -PassThru `
-              -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
-          Write-Host "  Started PID: $($serveProc.Id)"
-
-          # 等待 8080 端口就绪
-          $timeout = 60
-          $elapsed = 0
-          do {
-              Start-Sleep -Seconds 3
-              $elapsed += 3
-              $listening = netstat -an | Select-String ":8080.*LISTENING"
-              if ($listening) { break }
-              $alive = Get-Process -Id $serveProc.Id -ErrorAction SilentlyContinue
-              if (-not $alive) {
-                  Write-Host "--- stdout ---"
-                  if (Test-Path $logFile) { Get-Content $logFile -Tail 10 -ErrorAction SilentlyContinue }
-                  Write-Host "--- stderr ---"
-                  if (Test-Path "${logFile}.err") { Get-Content "${logFile}.err" -Tail 10 -ErrorAction SilentlyContinue }
-                  Write-Error "llama serve exited prematurely."
-                  exit 1
-              }
-              Write-Host "  Waiting for llama serve... ${elapsed}s"
-          } while ($elapsed -lt $timeout)
-
-          if ($listening) {
-              Write-Host "llama.cpp serve is listening on 0.0.0.0:8080 (PID: $($serveProc.Id))."
-          } else {
-              Write-Warning "llama.cpp serve not listening after ${timeout}s, but process is running."
-          }
-
-          # 验证端口可访问
-          Write-Host "Verifying llama service on 127.0.0.1:8080..."
-          try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8080" -TimeoutSec 10 -UseBasicParsing
-              Write-Host "  HTTP 响应: $($r.StatusCode)"
-          } catch {
-              Write-Host "  127.0.0.1:8080 暂时不可用（模型可能仍在加载中）：$_"
-          }
 
           # 保持 runner 持续运行
           while ($true) {
