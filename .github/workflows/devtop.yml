@@ -1,0 +1,409 @@
+name: devtop
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # 启用远程桌面，禁用网络级身份认证（如需）
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          # 尝试直接禁用 Windows 防火墙（所有配置文件）
+          netsh advfirewall set allprofiles state off
+          Write-Host "Windows Firewall 已禁用，所有端口均已放行。"
+          # 重启远程桌面服务使变更生效
+          Restart-Service -Name TermService -Force
+      - name: Create RDP User with Secure Password
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # 验证 RDP_USERNAME 是否已配置
+          if (-not $env:RDP_USERNAME) {
+              Write-Error "RDP_USERNAME is not configured in GitHub Secrets. Please add it."
+              exit 1
+          }
+          Write-Host "RDP_USERNAME is configured: $env:RDP_USERNAME"
+          # 验证 RDP_PASSWORD 是否已配置
+          if (-not $env:RDP_PASSWORD) {
+              Write-Error "RDP_PASSWORD is not configured in GitHub Secrets. Please add it."
+              exit 1
+          }
+          Write-Host "RDP_PASSWORD is configured."
+          # 直接使用来自 Secrets 的密码创建用户
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
+          
+          if (-not (Get-LocalUser -Name $env:RDP_USERNAME)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+      - name: Uninstall Unnecessary Software
+        run: |
+          Write-Host "=== Uninstalling unnecessary software ==="
+          $regPaths = @(
+              'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $targets = @('*Google Chrome*', '*Mozilla Firefox*', '*Unity Hub*', 'R for Windows*', 'Rtools*')
+          Get-ItemProperty $regPaths -ErrorAction SilentlyContinue |
+              Where-Object { $name = $_.DisplayName; $matched = $false; foreach ($p in $targets) { if ($name -like $p) { $matched = $true } } $matched } |
+              ForEach-Object {
+                  Write-Host "  Uninstalling: $($_.DisplayName)"
+                  if ($_.PSChildName -match '^\{') {
+                      Start-Process msiexec.exe -ArgumentList "/x $($_.PSChildName) /quiet /norestart" -NoNewWindow -Wait
+                  } elseif ($_.UninstallString) {
+                      $exe = ($_.UninstallString -split '"')[1]
+                      if (-not $exe) { $exe = $_.UninstallString -split ' ' | Select-Object -First 1 }
+                      Start-Process -FilePath $exe -ArgumentList '/S /SILENT /SUPPRESSMSGBOXES /VERYSILENT --uninstall --force-uninstall' -NoNewWindow -Wait -ErrorAction SilentlyContinue
+                  }
+              }
+          Write-Host "Cleanup completed!"
+      - name: Install and Configure Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+        run: |
+          # ════════════════════════════════════════════
+          # 1. 安装 Tailscale
+          # ════════════════════════════════════════════
+          Write-Host "Installing Tailscale via winget..."
+          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "Tailscale.Tailscale", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { Write-Error "winget install Tailscale failed"; exit 1 }
+          $tsPath = [Environment]::GetFolderPath('ProgramFiles') + '\Tailscale'
+          $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($currentPath -notlike "*$tsPath*") {
+              [Environment]::SetEnvironmentVariable('Path', "$currentPath;$tsPath", 'Machine')
+          }
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+          Set-Service -Name Tailscale -StartupType Automatic
+          Write-Host "Tailscale installed."
+
+          # ════════════════════════════════════════════
+          # 2. 安装 OpenSSH Server（Tailscale SSH 需要本地 sshd）
+          # ════════════════════════════════════════════
+          Write-Host "Installing OpenSSH Server for Tailscale SSH..."
+          $sshCap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+          if ($sshCap.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name $sshCap.Name
+              if ($LASTEXITCODE -ne 0) { Write-Warning "OpenSSH Server install returned $LASTEXITCODE" }
+          } else { Write-Host "  OpenSSH Server already installed." }
+          Set-Service -Name sshd -StartupType 'Automatic'
+          Start-Service -Name sshd -ErrorAction SilentlyContinue
+          # 放行 Windows 防火墙 22 端口
+          netsh advfirewall firewall delete rule name="OpenSSH-Server-In-TCP"
+          netsh advfirewall firewall add rule name="OpenSSH-Server-In-TCP" dir=in action=allow protocol=TCP localport=22
+          Write-Host "OpenSSH Server ready."
+
+          # ════════════════════════════════════════════
+          # 3. 认证 Tailscale
+          # ════════════════════════════════════════════
+          if ("$env:TAILSCALE_AUTH_KEY" -eq "") { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
+          Write-Host "Authenticating Tailscale..."
+          # 注意：Tailscale SSH（--ssh）仅支持 Linux/macOS 服务端，
+          # Windows 上不生效。参见 https://tailscale.com/kb/1193/tailscale-ssh
+          # Windows 上的 SSH 使用传统的 OpenSSH over Tailscale 网络
+          & "$tsPath\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=windows
+          
+          # 等待 Tailscale 分配 IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$tsPath\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."; & "$tsPath\tailscale.exe" status; exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+          # ════════════════════════════════════════════
+          # 4. Tailscale API 操作（清理旧设备 + 设置名称 + MagicDNS + 子网路由）
+          # ════════════════════════════════════════════
+          if ("$env:TAILSCALE_API_TOKEN" -ne "") {
+              $apiBase = "https://api.tailscale.com/api/v2"
+              $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
+              
+              # 获取设备 ID
+              $statusJson = & "$tsPath\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+              $deviceId = $statusJson.Self.ID
+              
+              if ($deviceId) {
+                  try {
+                      # 清理旧 windows 设备
+                      $allDevices = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" -Method Get -Headers $headers
+                      $currentApi = $allDevices.devices | Where-Object { $_.nodeId -eq $deviceId }
+                      if ($currentApi) { $deviceId = $currentApi.id }
+                      
+                      $allDevices.devices | Where-Object { $_.hostname -eq "windows" -and $_.id -ne $deviceId } | ForEach-Object {
+                          Write-Host "  Cleaning old device: $($_.name) (ID: $($_.id))"
+                          try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)/authorized" -Method Post -Headers $headers -Body (@{ "authorized" = $false } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop } catch {}
+                          try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)" -Method Delete -Headers $headers -ErrorAction Stop } catch {}
+                      }
+                      # 设置主机名
+                      Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" -Method Post -Headers $headers -Body (@{ "name" = "windows" } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                      Write-Host "  Machine name set to 'windows'."
+                  } catch { Write-Warning "  API operation failed (non-critical): $_" }
+
+                  # MagicDNS
+                  try {
+                      $settings = Invoke-RestMethod -Uri "$apiBase/tailnet/-/settings" -Method Get -Headers $headers
+                      if ($settings.magicDNSEnabled -eq $false) {
+                          Invoke-RestMethod -Uri "$apiBase/tailnet/-/settings" -Method Patch -Headers $headers -Body (@{ "magicDNSEnabled" = $true } | ConvertTo-Json) -ContentType "application/json"
+                          Write-Host "  MagicDNS enabled."
+                      }
+                      $tailnetDomain = (& "$tsPath\tailscale.exe" status --json 2>$null | ConvertFrom-Json).MagicDNSSuffix
+                      if ($tailnetDomain) {
+                          echo "TAILSCALE_DNS=windows.$tailnetDomain" >> $env:GITHUB_ENV
+                          Write-Host "  MagicDNS: windows.$tailnetDomain"
+                      }
+                  } catch { Write-Warning "  MagicDNS check failed (non-critical): $_" }
+              }
+
+              # 重新读取最终 IP
+              $actualIP = & "$tsPath\tailscale.exe" ip -4
+              if ($actualIP) { echo "TAILSCALE_IP=$actualIP" >> $env:GITHUB_ENV }
+          }
+
+          # ════════════════════════════════════════════
+          # 5. 子网路由 + Exit Node
+          # ════════════════════════════════════════════
+          $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' -and $_.InterfaceAlias -ne 'Tailscale' }
+          $subnets = @()
+          foreach ($ip in $localIPs) {
+              $ipBytes = [System.Net.IPAddress]::Parse($ip.IPAddress).GetAddressBytes()
+              [Array]::Reverse($ipBytes)
+              $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
+              $maskInt = [uint32]::MaxValue -shl (32 - $ip.PrefixLength)
+              $netInt = $ipInt -band $maskInt
+              $netBytes = [System.BitConverter]::GetBytes($netInt)
+              [Array]::Reverse($netBytes)
+              $subnets += "$([System.Net.IPAddress]::new($netBytes).IPAddressToString)/$($ip.PrefixLength)"
+          }
+          Write-Host "Configuring Tailscale..."
+          & "$tsPath\tailscale.exe" set --advertise-routes="$($subnets -join ',')" --advertise-exit-node --accept-routes --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { Write-Warning "tailscale set 返回 $LASTEXITCODE（需控制台审批）" }
+
+          # 验证 OpenSSH Server 是否正在监听 22 端口
+          $sshListening = netstat -an | Select-String ":22.*LISTENING"
+          if ($sshListening) { Write-Host "  OpenSSH Server (端口 22) 已在监听 ✓" }
+          else { Write-Warning "  OpenSSH Server 未在监听，请检查 sshd 服务状态" }
+
+          Write-Host "Tailscale 配置完成！IP: $tsIP"
+
+          Write-Host "=== Tailscale 配置完成 ==="
+      - name: Install and Start llama.cpp
+        run: |
+          # ════════════════════════════════════════════
+          # 1. winget 安装 llama.cpp
+          #    --source winget 跳过 msstore 协议确认
+          # ════════════════════════════════════════════
+          Write-Host "Installing llama.cpp via winget..."
+          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "llama.cpp", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+              Write-Error "winget install llama.cpp failed with exit code $($proc.ExitCode)"
+              exit 1
+          }
+          Write-Host "llama.cpp installed via winget."
+
+          # 刷新 PATH，使 llama.exe 在当前会话中可用
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          # ════════════════════════════════════════════
+          # 2. 查找 llama.exe 并写入系统 PATH（持久化）
+          # ════════════════════════════════════════════
+          $llamaPath = & where.exe llama.exe 2>$null
+          if (-not $llamaPath) {
+              $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $llamaPath -or -not (Test-Path $llamaPath)) {
+              Write-Error "llama.exe not found after winget install"
+              exit 1
+          }
+          Write-Host "llama.cpp installed. Path: $llamaPath"
+
+          $llamaDir = Split-Path $llamaPath -Parent
+          $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($currentPath -notlike "*$llamaDir*") {
+              [Environment]::SetEnvironmentVariable('Path', "$currentPath;$llamaDir", 'Machine')
+              Write-Host "Added $llamaDir to system PATH."
+          }
+          # 跨步骤持久化 PATH
+          echo "$llamaDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          # ════════════════════════════════════════════
+          # 3. 使用 llama download 下载 MiniCPM5 模型（带 300s 超时）
+          # ════════════════════════════════════════════
+          Write-Host "Downloading MiniCPM5-1B-F16.gguf via llama download..."
+
+          $modelDir = "C:\ProgramData\llama-models"
+          $null = New-Item -Path $modelDir -ItemType Directory -Force
+          # 赋予 Everyone 读取权限，确保 RDP 用户也可访问
+          icacls $modelDir /grant "Everyone:(OI)(CI)R" /T /Q 2>$null
+          $modelPath = "$modelDir\MiniCPM5-1B-F16.gguf"
+
+          # llama download 带超时包装
+          $dlTimeout = 300
+          $dlJob = Start-Job -Name "ModelDownload" -ScriptBlock {
+              param($lp, $repo, $file)
+              & $lp download --hf-repo $repo --hf-file $file
+          } -ArgumentList $llamaPath, "openbmb/MiniCPM5-1B-GGUF", "MiniCPM5-1B-F16.gguf"
+          $dlJob | Wait-Job -Timeout $dlTimeout | Out-Null
+          if ($dlJob.State -eq 'Running') {
+              $dlJob | Stop-Job | Out-Null
+              Write-Warning "Model download timed out after ${dlTimeout}s, continuing with cache search..."
+          }
+          Receive-Job $dlJob 2>&1 | Out-Null
+
+          # 不依赖 $LASTEXITCODE（新版可能返回非零即使成功），搜索缓存/模型目录
+          if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
+              $cacheRoots = @(
+                  "$modelDir"
+                  "$env:USERPROFILE\.cache\huggingface\hub"
+                  "$env:LOCALAPPDATA\huggingface\hub"
+                  [Environment]::GetFolderPath('CommonApplicationData') + "\huggingface\hub"
+              )
+              $downloaded = $null
+              foreach ($root in $cacheRoots) {
+                  if (Test-Path $root) {
+                      $found = Get-ChildItem -Path $root -Filter "MiniCPM5-1B-F16.gguf" -Recurse -ErrorAction SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                      if ($found) { $downloaded = $found; break }
+                  }
+              }
+              if ($downloaded) {
+                  Write-Host "  Found in cache: $($downloaded.FullName)"
+                  Copy-Item $downloaded.FullName $modelPath -Force
+              }
+          }
+
+          if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
+              Write-Error "llama download failed — check network or Hugging Face availability"
+              exit 1
+          }
+          $localMB = [math]::Round((Get-Item $modelPath).Length / 1MB, 2)
+          Write-Host "Model ready at: $modelPath ($localMB MB)"
+
+          # ════════════════════════════════════════════
+          # 4. 创建开机启动计划任务
+          #    llama serve 本身在 Maintain Connection 步骤中启动
+          #    （因为 GitHub Actions 会在步骤结束时杀掉子进程）
+          # ════════════════════════════════════════════
+          $null = New-Item -Path "$env:ProgramData\llama-models" -ItemType Directory -Force
+
+          $logFile = "$env:ProgramData\llama-models\llama-server.log"
+          $serveArgs = "serve --port 8080 --host 0.0.0.0 --model `"$modelPath`""
+
+          $taskName = "llama-cpp-serve"
+          schtasks /CREATE /TN $taskName /SC ONSTART /DELAY 0001:00 /RL HIGHEST /RU SYSTEM /TR "`"$llamaPath`" $serveArgs" /F 2>$null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Created scheduled task '$taskName' for auto-start on boot."
+          } else {
+              Write-Warning "Scheduled task creation skipped (exit code: $LASTEXITCODE)."
+          }
+
+          Write-Host "llama.cpp install and model download complete. Server will start in next step."
+      - name: Maintain Connection
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "`n=== RDP + llama.cpp 服务已就绪 ==="
+          Write-Host "RDP Address (Tailscale IP): $env:TAILSCALE_IP"
+          if ($env:TAILSCALE_DNS) {
+              Write-Host "RDP Address (MagicDNS):    $env:TAILSCALE_DNS"
+          }
+          Write-Host "llama.cpp API:              http://$env:TAILSCALE_IP`:8080"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "===================================`n"
+
+          # 刷新 PATH（$env:GITHUB_PATH 在上一步已写，新进程才生效，此处手动刷新）
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          # 查找 llama.exe
+          $llamaPath = & where.exe llama.exe 2>$null
+          if (-not $llamaPath) { $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $llamaPath) {
+              # 最后兜底：winget 默认安装路径
+              $llamaPath = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama.exe"
+              if (-not (Test-Path $llamaPath)) { $llamaPath = $null }
+          }
+
+          if (-not $llamaPath) {
+              Write-Error "llama.exe not found. Install step may have failed."
+              exit 1
+          }
+
+          $modelPath = "C:\ProgramData\llama-models\MiniCPM5-1B-F16.gguf"
+          $logFile = "$env:ProgramData\llama-models\llama-server.log"
+
+          if (-not (Test-Path $modelPath)) {
+              Write-Error "Model not found at $modelPath. Download step may have failed."
+              exit 1
+          }
+
+          Write-Host "Starting llama.exe serve (PID will stay alive in this step)..."
+          $serveProc = Start-Process -FilePath $llamaPath `
+              -ArgumentList "serve --port 8080 --host 0.0.0.0 --model `"$modelPath`"" `
+              -NoNewWindow -PassThru `
+              -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
+          Write-Host "  Started PID: $($serveProc.Id)"
+
+          # 等待 8080 端口就绪
+          $timeout = 60
+          $elapsed = 0
+          do {
+              Start-Sleep -Seconds 3
+              $elapsed += 3
+              $listening = netstat -an | Select-String ":8080.*LISTENING"
+              if ($listening) { break }
+              $alive = Get-Process -Id $serveProc.Id -ErrorAction SilentlyContinue
+              if (-not $alive) {
+                  Write-Host "--- stdout ---"
+                  if (Test-Path $logFile) { Get-Content $logFile -Tail 10 -ErrorAction SilentlyContinue }
+                  Write-Host "--- stderr ---"
+                  if (Test-Path "${logFile}.err") { Get-Content "${logFile}.err" -Tail 10 -ErrorAction SilentlyContinue }
+                  Write-Error "llama serve exited prematurely."
+                  exit 1
+              }
+              Write-Host "  Waiting for llama serve... ${elapsed}s"
+          } while ($elapsed -lt $timeout)
+
+          if ($listening) {
+              Write-Host "llama.cpp serve is listening on 0.0.0.0:8080 (PID: $($serveProc.Id))."
+          } else {
+              Write-Warning "llama.cpp serve not listening after ${timeout}s, but process is running."
+          }
+
+          # 验证端口可访问
+          Write-Host "Verifying llama service on 127.0.0.1:8080..."
+          try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8080" -TimeoutSec 10 -UseBasicParsing
+              Write-Host "  HTTP 响应: $($r.StatusCode)"
+          } catch {
+              Write-Host "  127.0.0.1:8080 暂时不可用（模型可能仍在加载中）：$_"
+          }
+
+          # 保持 runner 持续运行
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
