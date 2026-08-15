@@ -184,15 +184,15 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
           Write-Host "Tailscale IP: $tsIP"
 
-      - name: Configure Tailscale (API Cleanup & MagicDNS)
+      - name: Configure Tailscale (API Cleanup)
         env:
           TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
         run: |
           $tsBin = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
 
-          # MagicDNS 依赖 API Token；未配置则跳过此步骤
+          # API 清理依赖 Token；未配置则跳过此步骤
           if (-not $env:TAILSCALE_API_TOKEN) {
-              Write-Host "TAILSCALE_API_TOKEN 未配置，跳过 API 清理 / MagicDNS 设置。"
+              Write-Host "TAILSCALE_API_TOKEN 未配置，跳过 API 清理。"
               exit 0
           }
 
@@ -221,19 +221,6 @@ jobs:
                   Write-Host "  Machine name set to 'devtop'."
               } catch { Write-Warning "  API 清理/改名失败（非致命）: $_" }
 
-              # MagicDNS
-              try {
-                  $settings = Invoke-RestMethod -Uri "$apiBase/tailnet/-/settings" -Method Get -Headers $headers
-                  if ($null -eq $settings.magicDNSEnabled -or $settings.magicDNSEnabled -eq $false) {
-                      Invoke-RestMethod -Uri "$apiBase/tailnet/-/settings" -Method Patch -Headers $headers -Body (@{ "magicDNSEnabled" = $true } | ConvertTo-Json) -ContentType "application/json"
-                      Write-Host "  MagicDNS enabled."
-                  }
-                  $tailnetDomain = (& $tsBin status --json 2>$null | ConvertFrom-Json).MagicDNSSuffix
-                  if ($tailnetDomain) {
-                      Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_DNS=devtop.$tailnetDomain"
-                      Write-Host "  MagicDNS: devtop.$tailnetDomain"
-                  }
-              } catch { Write-Warning "  MagicDNS 设置失败（非致命）: $_" }
           }
 
           # 重新读取最终 IP（设备名/设置可能引起变更）
@@ -286,9 +273,6 @@ jobs:
           if ($env:RDP_PASSWORD) { Write-Output "::add-mask::$env:RDP_PASSWORD" }
           Write-Host "`n=== RDP 服务已就绪 ==="
           Write-Host "RDP Address (Tailscale IP): $env:TAILSCALE_IP"
-          if ($env:TAILSCALE_DNS) {
-              Write-Host "RDP Address (MagicDNS):    $env:TAILSCALE_DNS"
-          }
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: （出于安全考虑，不在日志中显示）"
           Write-Host "===================================`n"
