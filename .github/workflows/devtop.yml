@@ -47,7 +47,7 @@ jobs:
           Restart-Service -Name TermService -Force -ErrorAction Stop
           Write-Host "::endgroup::"
 
-      - name: Create RDP User with Secure Password
+      - name: Configure Existing RDP User
         env:
           RDP_USERNAME: runneradmin
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -64,15 +64,13 @@ jobs:
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           try {
               $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
-              if ($existing) {
-                  Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
-                      -AccountNeverExpires -PasswordNeverExpires $true -ErrorAction Stop
-                  Write-Host "'$env:RDP_USERNAME' 已存在，已重置密码。"
-              } else {
-                  New-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
-                      -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop | Out-Null
-                  Write-Host "'$env:RDP_USERNAME' 创建成功。"
+              if (-not $existing) {
+                  throw "Local account '$env:RDP_USERNAME' does not exist; refusing to create it."
               }
+
+              Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
+                  -AccountNeverExpires -PasswordNeverExpires $true -ErrorAction Stop
+              Write-Host "'$env:RDP_USERNAME' 已存在，已重置密码。"
 
               Enable-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop
               $userSid = (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop).SID.Value

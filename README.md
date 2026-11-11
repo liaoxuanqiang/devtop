@@ -23,7 +23,7 @@
 | 步骤 | 说明 |
 |------|------|
 | ① 配置核心 RDP 设置 | 启用远程桌面服务和 NLA，保持 Windows 防火墙开启，仅允许 Tailscale IPv4 地址访问 RDP |
-| ② 创建 RDP 用户 | 使用 `RDP_PASSWORD` Secret 为 `runneradmin` 设置密码，并确保账户启用且加入管理员/远程桌面组 |
+| ② 配置现有 RDP 用户 | 使用 `RDP_PASSWORD` Secret 为现有 `runneradmin` 设置密码；账户不存在时工作流会失败，不会创建账户 |
 | ③ 卸载不必要的软件 | 通过注册表遍历卸载列表，清理 Chrome / Firefox / Unity Hub / R / Rtools 等 |
 | ④ 安装并配置 Tailscale | 安装 Tailscale，完成设备认证、清理旧设备并固定主机名，广播子网路由并启用 Exit Node |
 | ⑤ 保持连接 | 循环输出日志保活 Runner，确保云桌面在任务超时（默认 360 分钟）前持续在线 |
