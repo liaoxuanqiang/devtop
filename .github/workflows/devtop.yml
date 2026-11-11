@@ -46,14 +46,14 @@ jobs:
           Write-Host "::endgroup::"
       - name: Create RDP User with Secure Password
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: runneradmin
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           # 将密码加入日志遮盖列表（GitHub 对 secret 自动遮盖，此为双保险）
           if ($env:RDP_PASSWORD) { Write-Output "::add-mask::$env:RDP_PASSWORD" }
 
           if ([string]::IsNullOrEmpty($env:RDP_USERNAME)) {
-              Write-Error "RDP_USERNAME is not configured in GitHub Secrets. Please add it."
+              Write-Error "RDP_USERNAME is not configured."
               exit 1
           }
           if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
@@ -267,7 +267,7 @@ jobs:
           Write-Host "=== Tailscale 配置完成 ==="
       - name: Maintain Connection
         env:
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_USERNAME: runneradmin
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ($env:RDP_PASSWORD) { Write-Output "::add-mask::$env:RDP_PASSWORD" }
