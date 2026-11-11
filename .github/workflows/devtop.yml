@@ -93,10 +93,24 @@ jobs:
                               Write-Warning "    msiexec 退出码 $($p.ExitCode)，卸载可能未完成"
                           }
                       } elseif ($pkg.UninstallString) {
-                          $exe = ($pkg.UninstallString -split '"')[1]
-                          if (-not $exe) { $exe = ($pkg.UninstallString -split ' ')[0] }
-                          if ($exe) {
-                              Start-Process -FilePath $exe -ArgumentList '/S /SILENT /SUPPRESSMSGBOXES /VERYSILENT --uninstall --force-uninstall' -NoNewWindow -Wait -ErrorAction Stop
+                          $command = if ($pkg.QuietUninstallString) { $pkg.QuietUninstallString } else { $pkg.UninstallString }
+                          $command = [Environment]::ExpandEnvironmentVariables($command)
+                          if ($command -match '^\s*"(?<exe>[^"]+)"\s*(?<args>.*)$') {
+                              $exe = $Matches.exe
+                              $arguments = [string]$Matches.args
+                          } elseif ($command -match '^\s*(?<exe>.+?\.exe)(?:\s+(?<args>.*))?$') {
+                              $exe = $Matches.exe.Trim()
+                              $arguments = [string]$Matches.args
+                          } else {
+                              throw "无法解析卸载命令: $command"
+                          }
+
+                          if (-not $pkg.QuietUninstallString) {
+                              $arguments = "$arguments /S /SILENT /SUPPRESSMSGBOXES /VERYSILENT --uninstall --force-uninstall".Trim()
+                          }
+                          $p = Start-Process -FilePath $exe -ArgumentList $arguments -NoNewWindow -Wait -PassThru -ErrorAction Stop
+                          if ($p.ExitCode -notin 0, 1605, 3010) {
+                              Write-Warning "    卸载进程退出码 $($p.ExitCode)，卸载可能未完成"
                           }
                       }
                   } catch {
@@ -107,7 +121,7 @@ jobs:
       - name: Install Tailscale
         run: |
           Write-Host "::group::Install Tailscale via winget"
-          $tsDir = [Environment]::GetFolderPath('ProgramFiles') + '\Tailscale'
+          $tsDir = Join-Path $env:ProgramFiles 'Tailscale'
           $tsBin = Join-Path $tsDir 'tailscale.exe'
 
           if (-not (Test-Path $tsBin)) {
@@ -120,6 +134,11 @@ jobs:
               }
           } else {
               Write-Host "  Tailscale already installed."
+          }
+
+          if (-not (Test-Path -LiteralPath $tsBin)) {
+              Write-Error "Tailscale executable not found: $tsBin"
+              exit 1
           }
 
           Add-Content -Path $env:GITHUB_ENV -Value "TS_BIN=$tsBin"
@@ -142,8 +161,7 @@ jobs:
 
           $tsIP = $null
           for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
-              $line = & $env:TS_BIN ip -4 2>$null | Select-Object -First 1
-              if ($line) { $tsIP = ($line -split '\s+')[0] }
+              $tsIP = & $env:TS_BIN ip -4 2>$null | Select-Object -First 1
               if (-not $tsIP) { Start-Sleep -Seconds 5 }
           }
           if (-not $tsIP) {
