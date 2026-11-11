@@ -19,6 +19,8 @@ jobs:
     runs-on: windows-latest
     # 与 cron（每 6 小时）对齐，保证单次运行覆盖整个调度周期
     timeout-minutes: 360
+    env:
+      RDP_USERNAME: runneradmin
 
     defaults:
       run:
@@ -49,17 +51,12 @@ jobs:
 
       - name: Configure Existing RDP User
         env:
-          RDP_USERNAME: runneradmin
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # 将密码加入日志遮盖列表（GitHub 对 secret 自动遮盖，此为双保险）
-          if ($env:RDP_PASSWORD) { Write-Output "::add-mask::$env:RDP_PASSWORD" }
-
           if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
               Write-Error "RDP_PASSWORD is not configured in GitHub Secrets. Please add it."
               exit 1
           }
-          Write-Host "RDP_USERNAME is configured."
 
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           try {
@@ -73,7 +70,7 @@ jobs:
               Write-Host "'$env:RDP_USERNAME' 已存在，已重置密码。"
 
               Enable-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop
-              $userSid = (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop).SID.Value
+              $userSid = $existing.SID.Value
               foreach ($group in @('Administrators', 'Remote Desktop Users')) {
                   $isMember = Get-LocalGroupMember -Group $group -ErrorAction Stop |
                       Where-Object { $_.SID.Value -eq $userSid }
@@ -83,11 +80,6 @@ jobs:
               }
           } catch {
               Write-Error "RDP 用户配置失败: $($_.Exception.Message)"
-              exit 1
-          }
-
-          if (-not (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue)) {
-              Write-Error "RDP 用户存在性校验失败"
               exit 1
           }
       - name: Uninstall Unnecessary Software
@@ -143,15 +135,8 @@ jobs:
               Write-Host "  Tailscale already installed."
           }
 
-          # 持久化 PATH 与二进制路径，供后续步骤使用
-          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-          if ($machinePath -notlike "*$tsDir*") {
-              [Environment]::SetEnvironmentVariable('Path', "$machinePath;$tsDir", 'Machine') | Out-Null
-          }
-          Write-Output $tsDir | Add-Content -Path $env:GITHUB_PATH
+          # Persist the binary path for later steps.
           Add-Content -Path $env:GITHUB_ENV -Value "TS_BIN=$tsBin"
-
-          Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
           Write-Host "::endgroup::Tailscale ready at $tsBin"
 
       - name: Authenticate Tailscale
@@ -162,11 +147,9 @@ jobs:
               Write-Error "TAILSCALE_AUTH_KEY is not configured in GitHub Secrets."
               exit 1
           }
-          $tsBin = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
           Write-Host "Authenticating Tailscale (hostname=devtop)..."
           # 认证密钥由 GitHub 自动遮盖，不会出现在日志
-          & $tsBin up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=devtop
+          & $env:TS_BIN up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=devtop
           if ($LASTEXITCODE -ne 0) {
               Write-Error "tailscale up failed (exit $LASTEXITCODE)"
               exit 1
@@ -175,13 +158,13 @@ jobs:
           # 等待 Tailscale 分配 IPv4（最长约 150 秒，原实现仅 50 秒）
           $tsIP = $null
           for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
-              $line = & $tsBin ip -4 2>$null | Select-Object -First 1
+              $line = & $env:TS_BIN ip -4 2>$null | Select-Object -First 1
               if ($line) { $tsIP = ($line -split '\s+')[0] }
               if (-not $tsIP) { Start-Sleep -Seconds 5 }
           }
           if (-not $tsIP) {
               Write-Error "Tailscale 未能分配 IP："
-              & $tsBin status
+              & $env:TS_BIN status
               exit 1
           }
 
@@ -193,8 +176,6 @@ jobs:
         env:
           TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
         run: |
-          $tsBin = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
           # API 清理依赖 Token；未配置则跳过此步骤
           if (-not $env:TAILSCALE_API_TOKEN) {
               Write-Host "TAILSCALE_API_TOKEN 未配置，跳过 API 清理。"
@@ -206,7 +187,7 @@ jobs:
           $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
 
           try {
-              $statusOutput = & $tsBin status --json 2>$null
+              $statusOutput = & $env:TS_BIN status --json 2>$null
               if ($LASTEXITCODE -ne 0) { throw "tailscale status failed (exit $LASTEXITCODE)" }
               $nodeId = ($statusOutput | ConvertFrom-Json -ErrorAction Stop).Self.ID
               if (-not $nodeId) { throw "Could not read the current Tailscale node ID." }
@@ -250,15 +231,10 @@ jobs:
               Write-Warning "  API cleanup/rename failed (non-fatal): $($_.Exception.Message)"
           }
 
-          # 重新读取最终 IP（设备名/设置可能引起变更）
-          $actualIP = & $tsBin ip -4 2>$null | Select-Object -First 1
-          if ($actualIP) { Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$actualIP" }
           Write-Host "::endgroup::Tailscale API operations done"
 
       - name: Configure Subnet Routes and Exit Node
         run: |
-          $tsBin = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
           Write-Host "::group::Advertise routes / exit node"
           $localIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
               $_.IPAddress -ne '127.0.0.1' -and
@@ -297,7 +273,7 @@ jobs:
           } else {
               Write-Warning "未找到可广播的子网，跳过 advertise-routes"
           }
-          & $tsBin @setArgs
+          & $env:TS_BIN @setArgs
           if ($LASTEXITCODE -ne 0) {
               Write-Error "Tailscale Exit Node / route configuration failed (exit $LASTEXITCODE)"
               exit 1
@@ -307,11 +283,7 @@ jobs:
           Write-Host "Tailscale 配置完成！IP: $env:TAILSCALE_IP"
           Write-Host "=== Tailscale 配置完成 ==="
       - name: Maintain Connection
-        env:
-          RDP_USERNAME: runneradmin
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ($env:RDP_PASSWORD) { Write-Output "::add-mask::$env:RDP_PASSWORD" }
           Write-Host "`n=== RDP 服务已就绪 ==="
           Write-Host "RDP Address (Tailscale IP): $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USERNAME"
