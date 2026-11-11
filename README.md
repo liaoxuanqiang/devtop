@@ -7,7 +7,7 @@
 ## ✨ 功能特性
 
 - 🖥️ **一键启动 Windows 云桌面**：使用 GitHub 官方的 `windows-latest` Runner，无需自备服务器
-- 🔑 **基于 GitHub Secrets 的安全认证**：RDP 密码从 Secrets 读取且不出现在日志中，用户名固定为 `runneradmin`
+- 🔑 **基于 GitHub Secrets 的安全认证**：RDP 密码从 Secrets 读取且不出现在日志中，用户名从 runner 进程读取
 - 🌐 **Tailscale 私有组网**：通过 WireGuard 协议加密组网，无需公网 IP，也无需在路由器上做端口映射
 - 🔒 **RDP 远程访问**：支持 `mstsc`（Windows） / Microsoft Remote Desktop（macOS / iOS / Android）等标准 RDP 客户端
 - ⚡ **自动清理旧设备**：每次启动都会通过 Tailscale API 删除历史遗留的 `devtop` 设备，避免设备堆积
@@ -23,7 +23,7 @@
 | 步骤 | 说明 |
 |------|------|
 | ① 配置核心 RDP 设置 | 启用远程桌面服务和 NLA，保持 Windows 防火墙开启，仅允许 Tailscale IPv4 地址访问 RDP |
-| ② 配置现有 RDP 用户 | 使用 `RDP_PASSWORD` Secret 为现有 `runneradmin` 设置密码；账户不存在时工作流会失败，不会创建账户 |
+| ② 配置现有 RDP 用户 | 从 runner 进程读取当前用户名，为现有本地账户设置 `RDP_PASSWORD`；不创建账户或修改用户组 |
 | ③ 卸载不必要的软件 | 通过注册表遍历卸载列表，清理 Chrome / Firefox / Unity Hub / R / Rtools 等 |
 | ④ 安装并配置 Tailscale | 安装 Tailscale，完成设备认证、清理旧设备并固定主机名，广播子网路由并启用 Exit Node |
 | ⑤ 保持连接 | 循环输出日志保活 Runner，确保云桌面在任务超时（默认 360 分钟）前持续在线 |
@@ -38,7 +38,7 @@
 
 | Secret 名称 | 是否必填 | 说明 |
 |-------------|----------|------|
-| `RDP_PASSWORD` | ✅ 必填 | `runneradmin` 的远程登录密码，建议使用强密码（大小写字母 + 数字 + 符号） |
+| `RDP_PASSWORD` | ✅ 必填 | 当前 runner 账户的远程登录密码，建议使用强密码（大小写字母 + 数字 + 符号） |
 | `TAILSCALE_AUTH_KEY` | ✅ 必填 | Tailscale 认证密钥，用于让新设备加入你的 tailnet 网络 |
 | `TAILSCALE_API_TOKEN` | ⚠️ 可选 | Tailscale API Token，配置后可自动清理旧设备并管理设备名称 |
 
@@ -81,7 +81,7 @@ schedule:
 ```
 === RDP 服务已就绪 ===
 RDP Address (Tailscale IP): 100.x.x.x
-Username: runneradmin
+Username: <runner account>
 Password: ********
 ===================================
 ```

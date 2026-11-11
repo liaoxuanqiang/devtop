@@ -1,15 +1,12 @@
 name: DevTop
 
-# "on" 键加引号，避免 YAML 解析歧义
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 */6 * * *'
 
-# 最小权限：本工作流不需要读写仓库内容
 permissions: {}
 
-# 并发保护：同一时刻只运行一个实例，防止定时与手动触发重叠
 concurrency:
   group: devtop-rdp
   cancel-in-progress: true
@@ -17,10 +14,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: windows-latest
-    # 与 cron（每 6 小时）对齐，保证单次运行覆盖整个调度周期
     timeout-minutes: 360
-    env:
-      RDP_USERNAME: runneradmin
 
     defaults:
       run:
@@ -38,7 +32,6 @@ jobs:
                              -Name "SecurityLayer" -Value 1 -Force
           Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -ErrorAction Stop
 
-          # Replace broad built-in RDP rules with one limited to Tailscale IPv4 peers.
           Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
               Disable-NetFirewallRule -ErrorAction Stop
           New-NetFirewallRule -DisplayName 'RDP over Tailscale only' `
@@ -60,24 +53,22 @@ jobs:
 
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           try {
-              $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+              $rdpUsername = $env:USERNAME
+              if ([string]::IsNullOrWhiteSpace($rdpUsername)) {
+                  throw "Could not determine the current runner username."
+              }
+
+              $existing = Get-LocalUser -Name $rdpUsername -ErrorAction SilentlyContinue
               if (-not $existing) {
-                  throw "Local account '$env:RDP_USERNAME' does not exist; refusing to create it."
+                  throw "Local account '$rdpUsername' does not exist; refusing to create it."
               }
 
-              Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
+              Set-LocalUser -Name $rdpUsername -Password $securePass `
                   -AccountNeverExpires -PasswordNeverExpires $true -ErrorAction Stop
-              Write-Host "'$env:RDP_USERNAME' 已存在，已重置密码。"
+              Write-Host "'$rdpUsername' 已存在，已重置密码。"
 
-              Enable-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop
-              $userSid = $existing.SID.Value
-              foreach ($group in @('Administrators', 'Remote Desktop Users')) {
-                  $isMember = Get-LocalGroupMember -Group $group -ErrorAction Stop |
-                      Where-Object { $_.SID.Value -eq $userSid }
-                  if (-not $isMember) {
-                      Add-LocalGroupMember -Group $group -Member $env:RDP_USERNAME -ErrorAction Stop
-                  }
-              }
+              Enable-LocalUser -Name $rdpUsername -ErrorAction Stop
+              Add-Content -Path $env:GITHUB_ENV -Value "RDP_USERNAME=$rdpUsername"
           } catch {
               Write-Error "RDP 用户配置失败: $($_.Exception.Message)"
               exit 1
@@ -97,7 +88,6 @@ jobs:
                   Write-Host "  Uninstalling: $($pkg.DisplayName)"
                   try {
                       if ($pkg.PSChildName -match '^\{') {
-                          # MSI 产品：通过 GUID 静默卸载
                           $p = Start-Process msiexec.exe -ArgumentList "/x $($pkg.PSChildName) /quiet /norestart" -NoNewWindow -Wait -PassThru -ErrorAction Stop
                           if ($p.ExitCode -notin 0, 1605, 3010) {
                               Write-Warning "    msiexec 退出码 $($p.ExitCode)，卸载可能未完成"
@@ -106,12 +96,10 @@ jobs:
                           $exe = ($pkg.UninstallString -split '"')[1]
                           if (-not $exe) { $exe = ($pkg.UninstallString -split ' ')[0] }
                           if ($exe) {
-                              # 尝试常见静默卸载参数（尽力而为）
                               Start-Process -FilePath $exe -ArgumentList '/S /SILENT /SUPPRESSMSGBOXES /VERYSILENT --uninstall --force-uninstall' -NoNewWindow -Wait -ErrorAction Stop
                           }
                       }
                   } catch {
-                      # 单条软件卸载失败不阻断整个工作流
                       Write-Warning "    卸载 '$($pkg.DisplayName)' 失败（非致命）: $($_.Exception.Message)"
                   }
               }
@@ -123,7 +111,6 @@ jobs:
           $tsBin = Join-Path $tsDir 'tailscale.exe'
 
           if (-not (Test-Path $tsBin)) {
-              # 幂等安装：已存在则跳过，避免 winget 重复操作
               winget install --id Tailscale.Tailscale --source winget `
                   --accept-package-agreements --accept-source-agreements `
                   --silent --disable-interactivity
@@ -135,7 +122,6 @@ jobs:
               Write-Host "  Tailscale already installed."
           }
 
-          # Persist the binary path for later steps.
           Add-Content -Path $env:GITHUB_ENV -Value "TS_BIN=$tsBin"
           Write-Host "::endgroup::Tailscale ready at $tsBin"
 
@@ -148,14 +134,12 @@ jobs:
               exit 1
           }
           Write-Host "Authenticating Tailscale (hostname=devtop)..."
-          # 认证密钥由 GitHub 自动遮盖，不会出现在日志
           & $env:TS_BIN up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=devtop
           if ($LASTEXITCODE -ne 0) {
               Write-Error "tailscale up failed (exit $LASTEXITCODE)"
               exit 1
           }
 
-          # 等待 Tailscale 分配 IPv4（最长约 150 秒，原实现仅 50 秒）
           $tsIP = $null
           for ($i = 0; $i -lt 30 -and -not $tsIP; $i++) {
               $line = & $env:TS_BIN ip -4 2>$null | Select-Object -First 1
@@ -168,7 +152,6 @@ jobs:
               exit 1
           }
 
-          # 暴露给后续步骤
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
           Write-Host "Tailscale IP: $tsIP"
 
@@ -176,7 +159,6 @@ jobs:
         env:
           TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
         run: |
-          # API 清理依赖 Token；未配置则跳过此步骤
           if (-not $env:TAILSCALE_API_TOKEN) {
               Write-Host "TAILSCALE_API_TOKEN 未配置，跳过 API 清理。"
               exit 0
@@ -255,7 +237,6 @@ jobs:
               )
               if (-not $isPrivate) { continue }
 
-              # IP + Prefix 长度 → 子网（IPv4 位运算）
               $ipBytes = $addressBytes
               [Array]::Reverse($ipBytes)
               $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
@@ -290,7 +271,6 @@ jobs:
           Write-Host "Password: （出于安全考虑，不在日志中显示）"
           Write-Host "===================================`n"
 
-          # 保持 runner 存活，直到任务超时或手动取消
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Cancel the workflow to stop"
               Start-Sleep -Seconds 300
