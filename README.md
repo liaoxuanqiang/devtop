@@ -7,7 +7,7 @@
 ## ✨ 功能特性
 
 - 🖥️ **一键启动 Windows 云桌面**：使用 GitHub 官方的 `windows-latest` Runner，无需自备服务器
-- 🔑 **基于 GitHub Secrets 的安全认证**：用户名与密码全部从 Secrets 读取，不硬编码、不出现在日志中
+- 🔑 **基于 GitHub Secrets 的安全认证**：RDP 密码从 Secrets 读取且不出现在日志中，用户名固定为 `runneradmin`
 - 🌐 **Tailscale 私有组网**：通过 WireGuard 协议加密组网，无需公网 IP，也无需在路由器上做端口映射
 - 🔒 **RDP 远程访问**：支持 `mstsc`（Windows） / Microsoft Remote Desktop（macOS / iOS / Android）等标准 RDP 客户端
 - ⚡ **自动清理旧设备**：每次启动都会通过 Tailscale API 删除历史遗留的 `devtop` 设备，避免设备堆积
@@ -22,8 +22,8 @@
 
 | 步骤 | 说明 |
 |------|------|
-| ① 配置核心 RDP 设置 | 启用远程桌面服务、关闭网络级身份认证（NLA）、禁用 Windows 防火墙 |
-| ② 创建 RDP 用户 | 从 Secrets 读取 `RDP_USERNAME` / `RDP_PASSWORD` 创建本地管理员账户，并加入 "Remote Desktop Users" 组 |
+| ① 配置核心 RDP 设置 | 启用远程桌面服务和 NLA，保持 Windows 防火墙开启，仅允许 Tailscale IPv4 地址访问 RDP |
+| ② 创建 RDP 用户 | 使用 `RDP_PASSWORD` Secret 为 `runneradmin` 设置密码，并确保账户启用且加入管理员/远程桌面组 |
 | ③ 卸载不必要的软件 | 通过注册表遍历卸载列表，清理 Chrome / Firefox / Unity Hub / R / Rtools 等 |
 | ④ 安装并配置 Tailscale | 安装 Tailscale，完成设备认证、清理旧设备并固定主机名，广播子网路由并启用 Exit Node |
 | ⑤ 保持连接 | 循环输出日志保活 Runner，确保云桌面在任务超时（默认 360 分钟）前持续在线 |
@@ -34,12 +34,11 @@
 
 ### 1. 配置 GitHub Secrets
 
-进入仓库 **Settings → Secrets and variables → Actions → New repository secret**，添加以下 4 个变量：
+进入仓库 **Settings → Secrets and variables → Actions → New repository secret**，添加以下 Secrets：
 
 | Secret 名称 | 是否必填 | 说明 |
 |-------------|----------|------|
-| `RDP_USERNAME` | ✅ 必填 | 远程登录用户名（如 `admin`），缺失时工作流会直接报错退出 |
-| `RDP_PASSWORD` | ✅ 必填 | 远程登录密码，建议使用强密码（大小写字母 + 数字 + 符号） |
+| `RDP_PASSWORD` | ✅ 必填 | `runneradmin` 的远程登录密码，建议使用强密码（大小写字母 + 数字 + 符号） |
 | `TAILSCALE_AUTH_KEY` | ✅ 必填 | Tailscale 认证密钥，用于让新设备加入你的 tailnet 网络 |
 | `TAILSCALE_API_TOKEN` | ⚠️ 可选 | Tailscale API Token，配置后可自动清理旧设备并管理设备名称 |
 
@@ -49,7 +48,7 @@
 
 ### 2. 允许 Actions 运行
 
-仓库 **Settings → Actions → General** 中，确保 *Workflow permissions* 设置为 **Read and write permissions** 或至少允许运行工作流。
+在仓库 **Settings → Actions → General** 中允许 GitHub Actions 运行。本工作流将 `GITHUB_TOKEN` 权限设为 `{}`，无需授予仓库读写权限；Tailscale 凭据通过 Actions Secrets 单独提供。
 
 ---
 
@@ -82,7 +81,7 @@ schedule:
 ```
 === RDP 服务已就绪 ===
 RDP Address (Tailscale IP): 100.x.x.x
-Username: admin
+Username: runneradmin
 Password: ********
 ===================================
 ```
@@ -122,16 +121,17 @@ on:
 1. 通过 `winget` 安装 Tailscale 客户端（已安装则自动跳过，保证幂等）
 2. 使用 Auth Key 完成设备认证，主机名固定为 `devtop`
 3. （可选，需 API Token）自动清理同名的旧设备，防止重复设备堆积
-4. 自动广播本地子网路由，并启用 Exit Node 功能（可在 Tailscale 管理后台审批使用）
+4. 广播检测到的 RFC1918 私有 IPv4 子网路由，并启用 Exit Node（可在 Tailscale 管理后台审批使用）；即使未检测到子网，也会单独启用 Exit Node
 
 ---
 
 ## ⚠️ 注意事项
 
 - **计费提醒**：GitHub Actions 免费额度包含 2000 分钟/月（公共仓库免费额度更多），长时间运行会消耗额度，请按需使用
-- **安全警告**：该工作流会**关闭 Windows 防火墙**并要求**关闭网络级身份认证（NLA）**，请务必为 RDP 用户设置强密码，并通过 Tailscale 私有网络访问，避免暴露到公网
+- **安全说明**：工作流保持 Windows 防火墙和 NLA 开启，并将 RDP 入站规则限制为 Tailscale IPv4 地址范围；客户端需支持 NLA
 - **密码安全**：`RDP_PASSWORD` 会作为环境变量传入工作流，虽然不会明文打印，但请避免使用个人常用密码
 - **权限提示**：Tailscale 的子网路由与 Exit Node 配置需要登录管理后台进行人工审批后才能生效
+- **局域网访问**：使用 Exit Node 时访问客户端自己的局域网，需在该客户端的 Tailscale 设置中单独开启 Allow LAN access
 - **连接前提**：RDP 连接前，请确保本机 Tailscale 已登录并处于同一 tailnet 网络
 - **并发保护**：工作流已启用并发控制（`concurrency`），定时任务与手动触发不会同时运行，后触发的运行会自动取消旧的运行，避免多台机器互相冲突
 

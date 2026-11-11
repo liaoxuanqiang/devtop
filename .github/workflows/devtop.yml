@@ -25,25 +25,28 @@ jobs:
         shell: pwsh
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure RDP and Firewall
         run: |
-          Write-Host "::group::Disable Windows Firewall"
-          # 直接禁用 Windows 防火墙（全部配置文件），访问控制交给 Tailscale ACL
-          netsh advfirewall set allprofiles state off
-          if ($LASTEXITCODE -ne 0) { Write-Warning "netsh advfirewall 返回 $LASTEXITCODE" }
-          Write-Host "::endgroup::"
-
-          Write-Host "::group::Enable RDP"
-          # 启用远程桌面；关闭网络级身份认证与安全层，方便任意 RDP 客户端接入
+          Write-Host "::group::Enable RDP with NLA"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+                             -Name "UserAuthentication" -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-          # 重启远程桌面服务使配置生效（首次启动报错可忽略）
-          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+                             -Name "SecurityLayer" -Value 1 -Force
+          Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -ErrorAction Stop
+
+          # Replace broad built-in RDP rules with one limited to Tailscale IPv4 peers.
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+              Disable-NetFirewallRule -ErrorAction Stop
+          New-NetFirewallRule -DisplayName 'RDP over Tailscale only' `
+              -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
+              -LocalAddress '100.64.0.0/10' -RemoteAddress '100.64.0.0/10' `
+              -Profile Any -ErrorAction Stop | Out-Null
+
+          Restart-Service -Name TermService -Force -ErrorAction Stop
           Write-Host "::endgroup::"
+
       - name: Create RDP User with Secure Password
         env:
           RDP_USERNAME: runneradmin
@@ -52,10 +55,6 @@ jobs:
           # 将密码加入日志遮盖列表（GitHub 对 secret 自动遮盖，此为双保险）
           if ($env:RDP_PASSWORD) { Write-Output "::add-mask::$env:RDP_PASSWORD" }
 
-          if ([string]::IsNullOrEmpty($env:RDP_USERNAME)) {
-              Write-Error "RDP_USERNAME is not configured."
-              exit 1
-          }
           if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
               Write-Error "RDP_PASSWORD is not configured in GitHub Secrets. Please add it."
               exit 1
@@ -63,22 +62,30 @@ jobs:
           Write-Host "RDP_USERNAME is configured."
 
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
-
-          if ($existing) {
-              # 幂等处理：runner 复用场景下重置密码即可，避免重复创建报错
-              Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
-              Write-Host "'$env:RDP_USERNAME' 已存在，已重置密码。"
-          } else {
-              try {
-                  New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
-                  Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
-                  Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
-                  Write-Host "'$env:RDP_USERNAME' 创建成功并加入管理员/远程桌面组。"
-              } catch {
-                  Write-Error "RDP 用户创建失败: $($_.Exception.Message)"
-                  exit 1
+          try {
+              $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+              if ($existing) {
+                  Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
+                      -AccountNeverExpires -PasswordNeverExpires $true -ErrorAction Stop
+                  Write-Host "'$env:RDP_USERNAME' 已存在，已重置密码。"
+              } else {
+                  New-LocalUser -Name $env:RDP_USERNAME -Password $securePass `
+                      -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop | Out-Null
+                  Write-Host "'$env:RDP_USERNAME' 创建成功。"
               }
+
+              Enable-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop
+              $userSid = (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction Stop).SID.Value
+              foreach ($group in @('Administrators', 'Remote Desktop Users')) {
+                  $isMember = Get-LocalGroupMember -Group $group -ErrorAction Stop |
+                      Where-Object { $_.SID.Value -eq $userSid }
+                  if (-not $isMember) {
+                      Add-LocalGroupMember -Group $group -Member $env:RDP_USERNAME -ErrorAction Stop
+                  }
+              }
+          } catch {
+              Write-Error "RDP 用户配置失败: $($_.Exception.Message)"
+              exit 1
           }
 
           if (-not (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue)) {
@@ -200,27 +207,49 @@ jobs:
           $apiBase = "https://api.tailscale.com/api/v2"
           $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
 
-          # 获取当前设备 ID
-          $statusJson = & $tsBin status --json 2>$null | ConvertFrom-Json
-          $deviceId = $statusJson.Self.ID
+          try {
+              $statusOutput = & $tsBin status --json 2>$null
+              if ($LASTEXITCODE -ne 0) { throw "tailscale status failed (exit $LASTEXITCODE)" }
+              $nodeId = ($statusOutput | ConvertFrom-Json -ErrorAction Stop).Self.ID
+              if (-not $nodeId) { throw "Could not read the current Tailscale node ID." }
 
-          if ($deviceId) {
-              try {
-                  # 清理旧的 devtop 设备（保留当前仍在运行的这台）
-                  $allDevices = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" -Method Get -Headers $headers
-                  $currentApi = $allDevices.devices | Where-Object { $_.nodeId -eq $deviceId }
-                  if ($currentApi) { $deviceId = $currentApi.id }
+              $allDevices = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" `
+                  -Method Get -Headers $headers -ErrorAction Stop
+              $currentApi = $allDevices.devices |
+                  Where-Object { $_.nodeId -eq $nodeId } |
+                  Select-Object -First 1
+              if (-not $currentApi -or -not $currentApi.id) {
+                  throw "Could not map the current node to an API device; refusing stale-device cleanup."
+              }
 
-                  $allDevices.devices | Where-Object { $_.hostname -eq "devtop" -and $_.id -ne $deviceId } | ForEach-Object {
-                      Write-Host "  Cleaning old device: $($_.name) (ID: $($_.id))"
-                      try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)/authorized" -Method Post -Headers $headers -Body (@{ "authorized" = $false } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop } catch {}
-                      try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)" -Method Delete -Headers $headers -ErrorAction Stop } catch {}
+              $allDevices.devices |
+                  Where-Object { $_.hostname -eq 'devtop' -and $_.id -ne $currentApi.id } |
+                  ForEach-Object {
+                      $oldDevice = $_
+                      Write-Host "  Cleaning old device: $($oldDevice.name) (ID: $($oldDevice.id))"
+                      try {
+                          Invoke-RestMethod -Uri "$apiBase/device/$($oldDevice.id)/authorized" `
+                              -Method Post -Headers $headers `
+                              -Body (@{ authorized = $false } | ConvertTo-Json) `
+                              -ContentType "application/json" -ErrorAction Stop
+                      } catch {
+                          Write-Warning "  Could not deauthorize '$($oldDevice.name)': $($_.Exception.Message)"
+                      }
+                      try {
+                          Invoke-RestMethod -Uri "$apiBase/device/$($oldDevice.id)" `
+                              -Method Delete -Headers $headers -ErrorAction Stop
+                      } catch {
+                          Write-Warning "  Could not delete '$($oldDevice.name)': $($_.Exception.Message)"
+                      }
                   }
-                  # 将设备名固定为 devtop
-                  Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" -Method Post -Headers $headers -Body (@{ "name" = "devtop" } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                  Write-Host "  Machine name set to 'devtop'."
-              } catch { Write-Warning "  API 清理/改名失败（非致命）: $_" }
 
+              Invoke-RestMethod -Uri "$apiBase/device/$($currentApi.id)/name" `
+                  -Method Post -Headers $headers `
+                  -Body (@{ name = 'devtop' } | ConvertTo-Json) `
+                  -ContentType "application/json" -ErrorAction Stop
+              Write-Host "  Machine name set to 'devtop'."
+          } catch {
+              Write-Warning "  API cleanup/rename failed (non-fatal): $($_.Exception.Message)"
           }
 
           # 重新读取最终 IP（设备名/设置可能引起变更）
@@ -233,16 +262,27 @@ jobs:
           $tsBin = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
 
           Write-Host "::group::Advertise routes / exit node"
-          $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+          $localIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
               $_.IPAddress -ne '127.0.0.1' -and
               $_.PrefixOrigin -ne 'WellKnown' -and
+              $_.AddressState -eq 'Preferred' -and
+              $_.PrefixLength -ge 1 -and
+              $_.PrefixLength -le 30 -and
               $_.InterfaceAlias -ne 'Tailscale'
           }
 
           $subnets = @()
           foreach ($ip in $localIPs) {
+              $addressBytes = [System.Net.IPAddress]::Parse($ip.IPAddress).GetAddressBytes()
+              $isPrivate = (
+                  ($addressBytes[0] -eq 10) -or
+                  ($addressBytes[0] -eq 172 -and $addressBytes[1] -ge 16 -and $addressBytes[1] -le 31) -or
+                  ($addressBytes[0] -eq 192 -and $addressBytes[1] -eq 168)
+              )
+              if (-not $isPrivate) { continue }
+
               # IP + Prefix 长度 → 子网（IPv4 位运算）
-              $ipBytes = [System.Net.IPAddress]::Parse($ip.IPAddress).GetAddressBytes()
+              $ipBytes = $addressBytes
               [Array]::Reverse($ipBytes)
               $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
               $maskInt = [uint32]::MaxValue -shl (32 - $ip.PrefixLength)
@@ -251,15 +291,18 @@ jobs:
               [Array]::Reverse($netBytes)
               $subnets += "$([System.Net.IPAddress]::new($netBytes).IPAddressToString)/$($ip.PrefixLength)"
           }
+          $subnets = @($subnets | Sort-Object -Unique)
 
+          $setArgs = @('set', '--advertise-exit-node', '--accept-routes', '--accept-dns=false')
           if ($subnets) {
-              & $tsBin set --advertise-routes="$($subnets -join ',')" `
-                         --advertise-exit-node --accept-routes --accept-dns=false
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "tailscale set 返回 $LASTEXITCODE（可能需要控制台审批路由/Exit Node）"
-              }
+              $setArgs += "--advertise-routes=$($subnets -join ',')"
           } else {
               Write-Warning "未找到可广播的子网，跳过 advertise-routes"
+          }
+          & $tsBin @setArgs
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale Exit Node / route configuration failed (exit $LASTEXITCODE)"
+              exit 1
           }
           Write-Host "::endgroup::"
 
